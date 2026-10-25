@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hallo-Live Chunked Streaming Demo</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#121a2b;--line:#29354b;--text:#e8eef9;--muted:#9aabc5;--accent:#78a9ff;--good:#6fe0a0;--bad:#ff8c8c}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top,#182743,var(--bg) 55%);color:var(--text);font:15px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:1120px;margin:0 auto;padding:28px 18px 60px}h1{font-size:clamp(25px,4vw,38px);margin:0 0 6px}p{color:var(--muted);margin-top:0}.layout{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(300px,.9fr);gap:18px;margin-top:22px}
+.card{background:rgba(18,26,43,.94);border:1px solid var(--line);border-radius:16px;padding:18px;min-width:0}label{display:block;font-weight:650;margin:14px 0 6px}textarea,input{width:100%;background:#0b1222;border:1px solid #35435d;color:var(--text);border-radius:10px;padding:11px;font:inherit}textarea{resize:vertical;min-height:140px}#script{min-height:240px}button{border:0;background:var(--accent);color:#071326;font-weight:750;border-radius:10px;padding:12px 17px;cursor:pointer;margin-top:14px}button:disabled{opacity:.45;cursor:wait}.status{padding:10px 12px;background:#0b1222;border:1px solid var(--line);border-radius:10px;color:var(--muted);overflow-wrap:anywhere}.metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:14px 0}.metric{padding:11px;border:1px solid var(--line);border-radius:10px;background:#0b1222}.metric strong{display:block;font-size:21px}.metric span{color:var(--muted);font-size:12px}.video-wrap{background:#05070b;border-radius:12px;overflow:hidden;aspect-ratio:992/512;display:flex;align-items:center;justify-content:center}video{width:100%;height:100%;object-fit:contain}#queue{max-height:180px;overflow:auto;color:var(--muted);font-size:13px;white-space:pre-wrap}.small{font-size:12px;color:var(--muted)}.pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:3px 9px;color:var(--muted);font-size:12px}.ok{color:var(--good)}.error{color:var(--bad)}@media(max-width:800px){.layout{grid-template-columns:1fr}#script{min-height:180px}}
+</style>
+</head>
+<body><main>
+<h1>Hallo-Live <span class="pill">Chunked streaming</span></h1>
+<p>Enter a long script. The backend splits it without dropping characters, generates one bounded prompt at a time, and makes each completed audio/video segment playable while the next segment generates.</p>
+<div id="health" class="status">Checking model status…</div>
+<div class="layout">
+<section class="card">
+<label for="script">Script to speak</label>
+<textarea id="script" placeholder="Paste a long script here…">Hello there. This is a streaming test. The final words are red apple.</textarea>
+<label for="scene">Visual scene prompt (kept consistent across chunks)</label>
+<textarea id="scene" rows="3">A realistic human avatar in a clean, softly lit studio, head-and-shoulders framing, camera fixed, face clearly visible, natural subtle expressions and readable lip movement.</textarea>
+<label for="audio">Audio caption</label>
+<textarea id="audio" rows="2">Clear, natural conversational voice, steady pace, clean close-mic speech, subtle room tone, no music.</textarea>
+<button id="start">Start streaming test</button>
+<p class="small">The character limit applies to the complete model prompt, including scene description, speech tags and audio caption. Keep the model process running for the entire session.</p>
+</section>
+<section class="card">
+<div class="video-wrap"><video id="player" controls playsinline></video></div>
+<div class="metrics">
+<div class="metric"><strong id="ttf">—</strong><span>Time to first playable audio/video</span></div>
+<div class="metric"><strong id="fps">—</strong><span>Cumulative output FPS</span></div>
+<div class="metric"><strong id="chunks">0 / 0</strong><span>Segments ready</span></div>
+<div class="metric"><strong id="chars">—</strong><span>Text integrity</span></div>
+</div>
+<div id="status" class="status">Ready.</div>
+<h3>Generation log</h3><div id="queue"></div>
+</section>
+</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let socket=null, playlist=[], playIndex=0, currentJob=null, received=0, total=0, isPlaying=false;
+function log(s){$('queue').textContent=(s+'\n'+$('queue').textContent).slice(0,9000)}
+async function health(){
+ try{const r=await fetch('/health');const h=await r.json();
+  if(h.model_ready){$('health').innerHTML='<span class="ok">Model ready.</span> Verified prompt limit: '+h.max_prompt_chars+' characters. Config: '+h.config}
+  else{$('health').innerHTML='<span class="error">Model not ready:</span> '+(h.model_error||'loading')}
+ }catch(e){$('health').textContent='Cannot reach backend: '+e}
+}
+health();setInterval(health,5000);
+function playNext(){
+ if(playIndex>=playlist.length){isPlaying=false;return}
+ isPlaying=true;const item=playlist[playIndex++];
+ $('player').src=item.url;$('player').load();
+ const p=$('player').play();if(p&&p.catch)p.catch(()=>{});
+ $('status').textContent='Playing segment '+item.index+' of '+item.total;
+}
+$('player').addEventListener('ended',()=>playNext());
+$('start').addEventListener('click',()=>{
+ if(socket)socket.close();
+ playlist=[];playIndex=0;received=0;total=0;isPlaying=false;currentJob=null;
+ $('ttf').textContent='—';$('fps').textContent='—';$('chunks').textContent='0 / 0';$('chars').textContent='Checking…';$('queue').textContent='';
+ $('status').textContent='Connecting…';$('start').disabled=true;
+ const proto=location.protocol==='https:'?'wss:':'ws:';
+ socket=new WebSocket(`${proto}//${location.host}/ws`);
+ socket.onopen=()=>socket.send(JSON.stringify({text:$('script').value,scene_prompt:$('scene').value,audio_caption:$('audio').value}));
+ socket.onmessage=async ev=>{
+  let m;try{m=JSON.parse(ev.data)}catch{return}
+  if(m.type==='started'){currentJob=m.job_id;total=m.chunks;$('chunks').textContent=`0 / ${total}`;$('chars').textContent=m.text_preserved_exactly?'Verified':'Failed';log(`Job ${m.job_id}: ${m.script_chars} chars → ${m.chunks} chunks; per-chunk speech budget ${m.max_speech_chars_per_chunk} chars.`);$('status').textContent='Generation started.'}
+  else if(m.type==='chunk_generating'){$('status').textContent=`Generating segment ${m.index}/${m.total}…`;log(`Generating ${m.index}/${m.total}: ${m.speech_chars} speech chars; prompt ${m.prompt_chars} chars.`)}
+  else if(m.type==='chunk_ready'){
+    received++;playlist.push({url:m.url,index:m.index,total:m.total});$('chunks').textContent=`${received} / ${total}`;
+    $('ttf').textContent=m.time_to_first_audio_video_seconds+' s';$('fps').textContent=(m.cumulative_fps??'—');
+    $('chars').textContent=m.text_preserved_exactly?'Verified':'FAILED';
+    log(`Ready ${m.index}/${m.total}: ${m.frames} frames, ${m.duration_seconds}s media, inference ${m.inference_seconds}s, segment FPS ${m.generation_fps}; cumulative FPS ${m.cumulative_fps}.`);
+    if(!isPlaying&&playlist.length===1)playNext();
+    else if(!isPlaying&&playIndex<playlist.length)playNext();
+  } else if(m.type==='complete'){
+    $('status').innerHTML=`<span class="ok">Complete.</span> ${m.chunks} segments; ${m.total_frames} frames / ${m.total_media_seconds}s media; overall ${m.overall_fps} FPS; first playable segment ${m.time_to_first_audio_video_seconds}s.`;
+    log('Complete. Exact text preservation check passed on backend.');
+  } else if(m.type==='error'){$('status').innerHTML='<span class="error">Error:</span> '+m.message;log('ERROR: '+m.message)}
+ };
+ socket.onerror=()=>{$('status').innerHTML='<span class="error">WebSocket error. Check backend logs and port forwarding.</span>'};
+ socket.onclose=()=>{$('start').disabled=false};
+});
+</script>
+</body></html>
